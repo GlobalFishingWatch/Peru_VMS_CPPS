@@ -1,0 +1,156 @@
+
+-- get a table with sum of fishing effort by month, fishing scale, origin, and gear grouped by decimal .01 degrees 
+
+
+---------------------------------------------------------------------------
+-- Function
+---------------------------------------------------------------------------
+
+-- Return the absolute value of the diff between the two timestamps in hours with microsecond precision If either parameter is null, return null
+CREATE TEMP FUNCTION
+  hours_diff_ABS(timestamp1 TIMESTAMP,
+    timestamp2 TIMESTAMP) AS (
+    ABS(TIMESTAMP_DIFF(timestamp1, timestamp2, microsecond) / 3600000000.0) );
+    
+
+---------------------------------------------------------------------------
+-- Selection
+---------------------------------------------------------------------------
+
+WITH
+
+
+-- get a list of classified vessel by scale and origin
+
+peru_classified AS (
+  SELECT
+    PLATE AS ssvid,
+    nickname AS shipname,
+    DESC_REGIMEN,
+    CASE
+      WHEN DESC_REGIMEN IN ('ARTESANAL', 
+                            'DECRETO LEGISLATIVO N° 1392', 
+                            'DECRETO LEGISLATIVO Nº1273', 
+                            'DS. 006-2016-PRODUCE', 
+                            'MENOR ESCALA (ANCHOVETA) - ARTESANAL', 
+                            'NO ESPECIFICADO') 
+          THEN 'artisanal'
+      WHEN DESC_REGIMEN IN ('DECRETO LEY Nº25977',
+                            'DS. 022-2009-PRODUCE',
+                            'DS. 032-2003-PRODUCE',
+                            'LEY Nº26920',
+                            'MENOR ESCALA',
+                            'MENOR ESCALA (ANCHOVETA)') 
+           THEN 'industrial'
+    ELSE
+    'not defined'
+  END
+    AS fishing_scale,
+  IF
+    (SAFE_CAST(SUBSTR(PLATE,1,1) AS FLOAT64) IS NULL AND 
+     SAFE_CAST(SUBSTR(PLATE,2,1) AS FLOAT64) IS NULL AND
+     SAFE_CAST(SUBSTR(PLATE,4,4) AS FLOAT64) / 3 IS NOT NULL AND
+     SAFE_CAST(SUBSTR(PLATE,-2,1) AS FLOAT64) IS NULL AND 
+     SAFE_CAST(SUBSTR(PLATE,-1,1) AS FLOAT64) IS NULL,
+      'peru',
+      'foreign') AS origin,
+  FROM
+    world-fishing-827.Peru_VMS.trasat_api_raw    
+  GROUP BY
+    ssvid,
+    shipname,
+    DESC_REGIMEN,
+    fishing_scale
+    
+),  # ssvid, shipname, fishing scale, origin
+
+
+-- include new_gear 
+peru_classified_gear AS (
+SELECT
+    *
+  FROM
+    peru_classified
+  JOIN
+    `world-fishing-827.Peru_VMS.gear_type_from_produce_registry`
+  USING
+    (ssvid) 
+),
+
+# get scored positions
+pos AS (
+select
+  ssvid,
+  msgid,
+  seg_id,
+  timestamp,
+      EXTRACT(MONTH
+    FROM
+      timestamp) AS month,  
+  LAG(timestamp, 1) OVER (PARTITION BY seg_id ORDER BY timestamp) prev_timestamp,
+  FLOOR(lat * 100) AS lat_bin,
+  FLOOR(lon * 100) AS lon_bin,
+  nnet_score  
+  FROM `pipe_peru_production_v20200324.messages_scored_*`  
+  WHERE _TABLE_SUFFIX BETWEEN '20200101' AND '20200930'
+),    
+    
+-- include classification in positions
+pos_peru AS(
+  SELECT
+    *
+  FROM
+    pos
+  JOIN
+    peru_classified_gear
+  USING
+    (ssvid) 
+),
+
+-- get fishing hours
+pos_hours AS (
+  SELECT
+    *,
+    IFNULL (hours_diff_abs (timestamp,
+        prev_timestamp),
+      0) hours
+  FROM
+    pos_peru
+),
+
+-- Summarize fishing
+fishing AS (
+  SELECT
+    month,
+    fishing_scale,
+    origin,
+    new_geartype_eng,
+    lat_bin / 100 AS lat_bin,
+    lon_bin / 100 AS lon_bin,
+    SUM(
+    IF
+      (nnet_score > 0.5,
+        hours,
+        0)) AS fishing_hours
+  FROM
+    pos_hours
+  GROUP BY
+    month,
+    fishing_scale,
+    origin,
+    new_geartype_eng,
+    lat_bin,
+    lon_bin 
+)
+
+
+--------------------------------------------------------------------------------
+--  Return
+--------------------------------------------------------------------------------
+
+SELECT
+  *,
+  fishing_hours/(COS(udfs_v20200701.radians(lat_bin)) * (111/100) * (111/100) ) AS fishing_hours_sq_km,
+FROM
+  fishing
+ 
